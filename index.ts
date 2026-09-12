@@ -5,7 +5,6 @@ const PROGRESS_TEXT = "Committing & pushing...";
 
 function setProgress(ctx: ExtensionContext, message: string | undefined) {
   ctx.ui.setStatus(PROGRESS_KEY, message);
-  ctx.ui.setWidget(PROGRESS_KEY, message ? [message] : undefined);
 }
 
 async function readHead(
