@@ -82,7 +82,7 @@ async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerCommand("qc", {
+  pi.registerCommand("commit", {
     description: "Commit all changes and push",
     handler: (_args, ctx) => commitAndPush(pi, ctx),
   });
