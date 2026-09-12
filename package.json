@@ -1,0 +1,11 @@
+{
+  "name": "omp-quick-commit",
+  "version": "0.1.0",
+  "description": "One-key cheap-model commit & push for OMP",
+  "license": "MIT",
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
