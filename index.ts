@@ -4,9 +4,16 @@ const PROGRESS_KEY = "omp-quick-commit";
 const PROGRESS_TEXT = "Committing & pushing...";
 
 function setProgress(ctx: ExtensionContext, message: string | undefined) {
-  ctx.ui.setWorkingMessage(message);
   ctx.ui.setStatus(PROGRESS_KEY, message);
   ctx.ui.setWidget(PROGRESS_KEY, message ? [message] : undefined);
+}
+
+async function readHead(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): Promise<string | null> {
+  const result = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: ctx.cwd });
+  return result.code === 0 ? result.stdout.trim() : null;
 }
 
 async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
@@ -17,30 +24,13 @@ async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
 
   try {
     setProgress(ctx, PROGRESS_TEXT);
-    pi.sendMessage(
-      {
-        customType: "omp-quick-commit.progress",
-        content: PROGRESS_TEXT,
-        display: true,
-        attribution: "agent",
-      },
-      { triggerTurn: false },
-    );
-    const previousHeadResult = await pi.exec("git", ["rev-parse", "HEAD"], {
-      cwd: ctx.cwd,
-    });
-    const previousHead =
-      previousHeadResult.code === 0 ? previousHeadResult.stdout.trim() : null;
+    const previousHead = await readHead(pi, ctx);
 
     const commitResult = await pi.exec("omp", ["commit", "--push"], {
       cwd: ctx.cwd,
     });
 
-    const currentHeadResult = await pi.exec("git", ["rev-parse", "HEAD"], {
-      cwd: ctx.cwd,
-    });
-    const currentHead =
-      currentHeadResult.code === 0 ? currentHeadResult.stdout.trim() : null;
+    const currentHead = await readHead(pi, ctx);
 
     const failureMessage =
       commitResult.stderr.trim() ||
