@@ -1,13 +1,31 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
+const PROGRESS_KEY = "omp-quick-commit";
+const PROGRESS_TEXT = "Committing & pushing...";
+
+function setProgress(ctx: ExtensionContext, message: string | undefined) {
+  ctx.ui.setWorkingMessage(message);
+  ctx.ui.setStatus(PROGRESS_KEY, message);
+  ctx.ui.setWidget(PROGRESS_KEY, message ? [message] : undefined);
+}
+
 async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
   if (!ctx.isIdle()) {
     ctx.ui.notify("Agent is busy; wait before committing", "warning");
     return;
   }
 
-  ctx.ui.setWorkingMessage("Committing & pushing...");
   try {
+    setProgress(ctx, PROGRESS_TEXT);
+    pi.sendMessage(
+      {
+        customType: "omp-quick-commit.progress",
+        content: PROGRESS_TEXT,
+        display: true,
+        attribution: "agent",
+      },
+      { triggerTurn: false },
+    );
     const previousHeadResult = await pi.exec("git", ["rev-parse", "HEAD"], {
       cwd: ctx.cwd,
     });
@@ -70,7 +88,7 @@ async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
       "error",
     );
   } finally {
-    ctx.ui.setWorkingMessage(undefined);
+    setProgress(ctx, undefined);
   }
 }
 

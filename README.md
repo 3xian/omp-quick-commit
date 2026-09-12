@@ -25,7 +25,7 @@ cp -r . ~/.omp/agent/extensions/omp-quick-commit
 | `/qc` | Commit all changes and push |
 | `Alt+C` | Same as `/qc` |
 
-On success, a message lists the new commits (`hash` + subject). Failures and “no new commit” cases show a notification instead.
+While `omp commit --push` runs, OMP shows a progress message in the session. On success, a follow-up message lists the new commits (`hash` + subject). Failures and “no new commit” cases show a notification instead.
 
 Requires `git` and `omp` on `PATH`. Uses the workspace cwd.
 
