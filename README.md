@@ -27,7 +27,7 @@ cp -r . ~/.omp/agent/extensions/omp-quick-commit
 | `Alt+C` | Same as `/commit` |
 | `Alt+Q` | Same as `/quick-commit` |
 
-While `omp commit --push` runs, a footer status line shows progress and is cleared when the run ends. On success, a follow-up message lists the new commits (`hash` + subject). Failures and “no new commit” cases show a notification instead.
+In the TUI, a spinner row above the editor reports progress with the same shimmer sweep as omp's built-in working indicator. It honors the `display.shimmer` setting; non-TUI modes keep their supported status output, and all progress is cleared when the run ends. On success, a follow-up message lists the new commits (`hash` + subject). Failures and “no new commit” cases show a notification instead.
 
 ### /quick-commit
 

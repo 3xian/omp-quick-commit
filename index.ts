@@ -1,5 +1,7 @@
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type * as Shimmer from "@oh-my-pi/pi-coding-agent/modes/theme/shimmer";
+import { Loader, type LoaderMessageColorFn } from "@oh-my-pi/pi-tui";
 
 const PROGRESS_KEY = "omp-quick-commit";
 const PROGRESS_TEXT = "Committing & pushing...";
@@ -27,8 +29,50 @@ const QUICK_SYSTEM_PROMPT = [
   "Describe only changes the log supports; never invent work.",
 ].join("\n");
 
-function setProgress(ctx: ExtensionContext, message: string | undefined) {
-  ctx.ui.setStatus(PROGRESS_KEY, message);
+type ProgressColorFn = LoaderMessageColorFn & { animated?: true };
+
+let shimmerPromise: Promise<typeof Shimmer | null> | undefined;
+
+/** Load the host shimmer when available without making it an extension requirement. */
+function loadShimmer(): Promise<typeof Shimmer | null> {
+  shimmerPromise ??= import(
+    "@oh-my-pi/pi-coding-agent/modes/theme/shimmer"
+  ).catch(() => null);
+  return shimmerPromise;
+}
+
+/** Loader variant without the leading gap already supplied by extension widgets. */
+class WidgetLoader extends Loader {
+  override render(width: number): readonly string[] {
+    return super.render(width).slice(1);
+  }
+}
+
+/** Show progress in the richest form supported by the current host mode. */
+async function showProgress(ctx: ExtensionContext, message: string) {
+  if (ctx.mode !== "tui") {
+    ctx.ui.setStatus(PROGRESS_KEY, message);
+    return;
+  }
+
+  const shimmer = await loadShimmer();
+  ctx.ui.setWidget(PROGRESS_KEY, (tui, theme) => {
+    const colorize: ProgressColorFn = shimmer
+      ? (text) => shimmer.shimmerText(text, theme)
+      : (text) => theme.fg("muted", text);
+    if (shimmer?.shimmerEnabled()) colorize.animated = true;
+    return new WidgetLoader(
+      tui,
+      (frame) => theme.fg("accent", frame),
+      colorize,
+      message,
+    );
+  });
+}
+
+function clearProgress(ctx: ExtensionContext) {
+  if (ctx.mode === "tui") ctx.ui.setWidget(PROGRESS_KEY, undefined);
+  else ctx.ui.setStatus(PROGRESS_KEY, undefined);
 }
 
 async function readHead(
@@ -240,7 +284,7 @@ async function quickCommitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
   }
 
   try {
-    setProgress(ctx, QUICK_PROGRESS_TEXT);
+    await showProgress(ctx, QUICK_PROGRESS_TEXT);
 
     const context = collectContext(ctx);
     if (!context) {
@@ -314,7 +358,7 @@ async function quickCommitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
       "error",
     );
   } finally {
-    setProgress(ctx, undefined);
+    clearProgress(ctx);
   }
 }
 
@@ -325,7 +369,7 @@ async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
   }
 
   try {
-    setProgress(ctx, PROGRESS_TEXT);
+    await showProgress(ctx, PROGRESS_TEXT);
     const previousHead = await readHead(pi, ctx);
 
     const commitResult = await pi.exec("omp", ["commit", "--push"], {
@@ -357,7 +401,7 @@ async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
       "error",
     );
   } finally {
-    setProgress(ctx, undefined);
+    clearProgress(ctx);
   }
 }
 
