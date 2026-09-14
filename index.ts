@@ -10,8 +10,8 @@ const QUICK_PROGRESS_TEXT = "Summarizing context & committing...";
 /** Most recent session entries scanned for the quick-commit summary. */
 const CONTEXT_ENTRIES = 12;
 /** Character budget for the assembled context prompt. */
-const CONTEXT_MAX_CHARS = 6000;
-const CONTEXT_ENTRY_MAX_CHARS = 2000;
+const CONTEXT_MAX_CHARS = 3000;
+const CONTEXT_ENTRY_MAX_CHARS = 1200;
 const CONTEXT_FILES_MAX = 30;
 
 /** Tools whose top-level `path` argument names the file the agent changed. */
@@ -31,15 +31,15 @@ const QUICK_SYSTEM_PROMPT = [
 
 type ProgressColorFn = LoaderMessageColorFn & { animated?: true };
 
-let shimmerPromise: Promise<typeof Shimmer | null> | undefined;
+let shimmerModule: typeof Shimmer | null = null;
+let commitInFlight = false;
 
-/** Load the host shimmer when available without making it an extension requirement. */
-function loadShimmer(): Promise<typeof Shimmer | null> {
-  shimmerPromise ??= import(
-    "@oh-my-pi/pi-coding-agent/modes/theme/shimmer"
-  ).catch(() => null);
-  return shimmerPromise;
-}
+// The host-internal shimmer is optional, so preload it without delaying startup.
+void import("@oh-my-pi/pi-coding-agent/modes/theme/shimmer")
+  .then(shimmer => {
+    shimmerModule = shimmer;
+  })
+  .catch(() => undefined);
 
 /** Loader variant without the leading gap already supplied by extension widgets. */
 class WidgetLoader extends Loader {
@@ -48,14 +48,14 @@ class WidgetLoader extends Loader {
   }
 }
 
-/** Show progress in the richest form supported by the current host mode. */
-async function showProgress(ctx: ExtensionContext, message: string) {
+/** Show progress immediately, using shimmer when its preload has completed. */
+function showProgress(ctx: ExtensionContext, message: string) {
   if (ctx.mode !== "tui") {
     ctx.ui.setStatus(PROGRESS_KEY, message);
     return;
   }
 
-  const shimmer = await loadShimmer();
+  const shimmer = shimmerModule;
   ctx.ui.setWidget(PROGRESS_KEY, (tui, theme) => {
     const colorize: ProgressColorFn = shimmer
       ? (text) => shimmer.shimmerText(text, theme)
@@ -75,6 +75,36 @@ function clearProgress(ctx: ExtensionContext) {
   else ctx.ui.setStatus(PROGRESS_KEY, undefined);
 }
 
+async function runCommitOperation(
+  ctx: ExtensionContext,
+  progressMessage: string,
+  fallbackError: string,
+  operation: () => Promise<void>,
+) {
+  if (!ctx.isIdle()) {
+    ctx.ui.notify("Agent is busy; wait before committing", "warning");
+    return;
+  }
+  if (commitInFlight) {
+    ctx.ui.notify("A commit is already in progress", "warning");
+    return;
+  }
+
+  commitInFlight = true;
+  try {
+    showProgress(ctx, progressMessage);
+    await operation();
+  } catch (error) {
+    ctx.ui.notify(
+      error instanceof Error ? error.message : fallbackError,
+      "error",
+    );
+  } finally {
+    commitInFlight = false;
+    clearProgress(ctx);
+  }
+}
+
 async function readHead(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -83,18 +113,47 @@ async function readHead(
   return result.code === 0 ? result.stdout.trim() : null;
 }
 
-/**
- * Echo the commits created since `previousHead` into the session, falling back
- * to a notification when git reports no subject lines.
- */
-async function echoNewCommits(
+type StagingOutcome =
+  | { kind: "ready" }
+  | { kind: "empty" }
+  | { kind: "failed"; message: string };
+
+async function stageChanges(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): Promise<StagingOutcome> {
+  const stageResult = await pi.exec("git", ["add", "-A"], { cwd: ctx.cwd });
+  if (stageResult.code !== 0) {
+    return {
+      kind: "failed",
+      message: stageResult.stderr.trim() || "git add failed",
+    };
+  }
+
+  const stagedResult = await pi.exec("git", ["diff", "--cached", "--quiet"], {
+    cwd: ctx.cwd,
+  });
+  if (stagedResult.code === 0) return { kind: "empty" };
+  if (stagedResult.code === 1) return { kind: "ready" };
+  return {
+    kind: "failed",
+    message: stagedResult.stderr.trim() || "Unable to inspect staged changes",
+  };
+}
+
+type NewCommits = {
+  currentHead: string;
+  summary: string;
+};
+
+/** Read commits created since `previousHead` without waiting for a push. */
+async function readNewCommits(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   previousHead: string | null,
-  label: string,
-): Promise<boolean> {
+): Promise<NewCommits | null> {
   const currentHead = await readHead(pi, ctx);
-  if (currentHead === null || currentHead === previousHead) return false;
+  if (currentHead === null || currentHead === previousHead) return null;
 
   const range = previousHead ? `${previousHead}..${currentHead}` : currentHead;
   const logResult = await pi.exec(
@@ -102,53 +161,66 @@ async function echoNewCommits(
     ["log", "--reverse", "--format=%h%x09%s", range],
     { cwd: ctx.cwd },
   );
-  const commitSummary = logResult.code === 0 ? logResult.stdout.trim() : "";
+  return {
+    currentHead,
+    summary: logResult.code === 0 ? logResult.stdout.trim() : "",
+  };
+}
 
-  if (commitSummary) {
+/** Echo newly created commits into the session. */
+function echoNewCommits(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commits: NewCommits | null,
+  label: string,
+): boolean {
+  if (!commits) return false;
+
+  if (commits.summary) {
     pi.sendMessage(
       {
         customType: "omp-quick-commit.result",
-        content: `${label}:\n\n${commitSummary}`,
+        content: `${label}:\n\n${commits.summary}`,
         display: true,
         attribution: "agent",
       },
       { triggerTurn: false },
     );
   } else {
-    ctx.ui.notify(`HEAD moved to ${currentHead.slice(0, 7)}`, "info");
+    ctx.ui.notify(`HEAD moved to ${commits.currentHead.slice(0, 7)}`, "info");
   }
   return true;
 }
 
-function textParts(content: unknown): string[] {
-  if (typeof content === "string") return [content];
-  if (!Array.isArray(content)) return [];
-  const parts: string[] = [];
-  for (const block of content) {
-    if (!block || typeof block !== "object") continue;
-    const { type, text } = block as { type?: unknown; text?: unknown };
-    if (type === "text" && typeof text === "string") parts.push(text);
-  }
-  return parts;
-}
+function contextParts(
+  content: unknown,
+): { text: string; files: string[] } {
+  if (typeof content === "string") return { text: content.trim(), files: [] };
+  if (!Array.isArray(content)) return { text: "", files: [] };
 
-function changedPaths(content: unknown): string[] {
-  if (!Array.isArray(content)) return [];
-  const paths: string[] = [];
+  const texts: string[] = [];
+  const files: string[] = [];
   for (const block of content) {
     if (!block || typeof block !== "object") continue;
-    const call = block as {
+    const part = block as {
       type?: unknown;
+      text?: unknown;
       name?: unknown;
       arguments?: unknown;
     };
-    if (call.type !== "toolCall" || typeof call.name !== "string") continue;
-    if (MUTATING_TOOLS[call.name] !== true) continue;
-    const args = call.arguments as { path?: unknown } | undefined;
-    const path = args?.path;
-    if (typeof path === "string" && path) paths.push(path);
+    if (part.type === "text" && typeof part.text === "string") {
+      texts.push(part.text);
+    }
+    if (
+      part.type === "toolCall" &&
+      typeof part.name === "string" &&
+      MUTATING_TOOLS[part.name] === true
+    ) {
+      const args = part.arguments as { path?: unknown } | undefined;
+      if (typeof args?.path === "string" && args.path) files.push(args.path);
+    }
   }
-  return paths;
+  return { text: texts.join("\n").trim(), files };
 }
 
 /**
@@ -162,39 +234,60 @@ function collectContext(ctx: ExtensionContext): string {
     .filter(entry => entry.type === "message")
     .slice(-CONTEXT_ENTRIES);
 
-  const turns: string[] = [];
-  const files = new Set<string>();
+  const turns: Array<{ text: string; files: string[] }> = [];
   for (const entry of entries) {
     if (entry.type !== "message") continue;
     const message = entry.message as { role?: unknown; content?: unknown };
     if (message.role !== "user" && message.role !== "assistant") continue;
-    const text = textParts(message.content).join("\n").trim();
-    if (text) {
-      const clipped =
-        text.length > CONTEXT_ENTRY_MAX_CHARS
-          ? `${text.slice(0, CONTEXT_ENTRY_MAX_CHARS)}…`
-          : text;
-      turns.push(`${message.role === "user" ? "User" : "Agent"}: ${clipped}`);
-    }
-    for (const path of changedPaths(message.content)) files.add(path);
+    const { text: rawText, files } = contextParts(message.content);
+    const clipped =
+      rawText.length > CONTEXT_ENTRY_MAX_CHARS
+        ? `${rawText.slice(0, CONTEXT_ENTRY_MAX_CHARS)}…`
+        : rawText;
+    turns.push({
+      text: clipped
+        ? `${message.role === "user" ? "User" : "Agent"}: ${clipped}`
+        : "",
+      files,
+    });
   }
 
-  // Keep whole turns, newest first, until the character budget is spent.
-  const kept: string[] = [];
+  // Keep whole turns, newest first, until the shared character budget is spent.
+  const kept: typeof turns = [];
   let used = 0;
   for (let index = turns.length - 1; index >= 0; index--) {
     const turn = turns[index];
-    if (kept.length > 0 && used + turn.length > CONTEXT_MAX_CHARS) break;
+    const separatorLength = turn.text && used > 0 ? 2 : 0;
+    if (
+      turn.text &&
+      used + separatorLength + turn.text.length > CONTEXT_MAX_CHARS
+    ) {
+      break;
+    }
     kept.unshift(turn);
-    used += turn.length + 2;
+    if (turn.text) {
+      used += separatorLength + turn.text.length;
+    }
   }
-  if (kept.length === 0) return "";
 
-  const body = kept.join("\n\n");
-  const fileList = [...files].slice(0, CONTEXT_FILES_MAX);
-  if (fileList.length === 0) return body;
-  const list = fileList.map(path => `- ${path}`).join("\n");
-  return `${body}\n\nFiles the agent edited recently:\n${list}`;
+  let context = kept
+    .map(turn => turn.text)
+    .filter(Boolean)
+    .join("\n\n");
+  if (!context) return "";
+
+  const files = new Set(kept.flatMap(turn => turn.files));
+  let fileCount = 0;
+  for (const path of files) {
+    if (fileCount >= CONTEXT_FILES_MAX) break;
+    const prefix =
+      fileCount === 0 ? "\n\nFiles the agent edited recently:\n" : "\n";
+    const addition = `${prefix}- ${path}`;
+    if (context.length + addition.length > CONTEXT_MAX_CHARS) break;
+    context += addition;
+    fileCount++;
+  }
+  return context;
 }
 
 function sanitizeCommitMessage(raw: string): string {
@@ -256,7 +349,7 @@ async function generateCommitMessage(
       apiKey,
       cwd: ctx.cwd,
       temperature: 0,
-      maxTokens: 1024,
+      maxTokens: 256,
       disableReasoning: true,
       acceptEmptyResponse: true,
     },
@@ -278,151 +371,141 @@ async function generateCommitMessage(
 }
 
 async function quickCommitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
-  if (!ctx.isIdle()) {
-    ctx.ui.notify("Agent is busy; wait before committing", "warning");
+  const context = collectContext(ctx);
+  if (!context) {
+    ctx.ui.notify(
+      "No agent context to summarize; use /commit instead",
+      "warning",
+    );
     return;
   }
 
-  try {
-    await showProgress(ctx, QUICK_PROGRESS_TEXT);
-
-    const context = collectContext(ctx);
-    if (!context) {
-      ctx.ui.notify(
-        "No agent context to summarize; use /commit instead",
-        "warning",
-      );
-      return;
-    }
-
-    const stageResult = await pi.exec("git", ["add", "-A"], { cwd: ctx.cwd });
-    if (stageResult.code !== 0) {
-      ctx.ui.notify(stageResult.stderr.trim() || "git add failed", "error");
-      return;
-    }
-
-    // Bail before the model call: a clean tree needs no message.
-    const stagedResult = await pi.exec("git", ["diff", "--cached", "--quiet"], {
-      cwd: ctx.cwd,
-    });
-    if (stagedResult.code === 0) {
-      ctx.ui.notify("No changes to commit", "warning");
-      return;
-    }
-
-    const message = await generateCommitMessage(ctx, context);
-    if (!message) return;
-
-    const previousHead = await readHead(pi, ctx);
-
-    const commitResult = await pi.exec("git", ["commit", "-m", message], {
-      cwd: ctx.cwd,
-    });
-    if (commitResult.code !== 0) {
-      const failure =
-        commitResult.stderr.trim() ||
-        commitResult.stdout.trim() ||
-        "Commit failed";
-      ctx.ui.notify(failure, "error");
-      return;
-    }
-
-    // `omp commit --push` never sets an upstream; a fresh branch would strand
-    // the commit locally, so track `origin/<branch>` when the branch has none.
-    const upstreamResult = await pi.exec(
-      "git",
-      ["rev-parse", "--abbrev-ref", "@{u}"],
-      { cwd: ctx.cwd },
+  const statusResult = await pi.exec("git", ["status", "--porcelain"], {
+    cwd: ctx.cwd,
+  });
+  if (statusResult.code !== 0) {
+    ctx.ui.notify(
+      statusResult.stderr.trim() || "git status failed",
+      "error",
     );
-    const pushResult = await pi.exec(
+    return;
+  }
+  if (!statusResult.stdout.trim()) {
+    ctx.ui.notify("No changes to commit", "warning");
+    return;
+  }
+
+  const [staging, message] = await Promise.all([
+    stageChanges(pi, ctx),
+    generateCommitMessage(ctx, context),
+  ]);
+  if (staging.kind === "failed") {
+    ctx.ui.notify(staging.message, "error");
+    return;
+  }
+  if (staging.kind === "empty") {
+    ctx.ui.notify("No changes to commit", "warning");
+    return;
+  }
+  if (!message) return;
+
+  const previousHead = await readHead(pi, ctx);
+  const commitResult = await pi.exec("git", ["commit", "-m", message], {
+    cwd: ctx.cwd,
+  });
+  if (commitResult.code !== 0) {
+    const failure =
+      commitResult.stderr.trim() ||
+      commitResult.stdout.trim() ||
+      "Commit failed";
+    ctx.ui.notify(failure, "error");
+    return;
+  }
+
+  // A fresh branch needs an explicit origin upstream.
+  const upstreamResult = await pi.exec(
+    "git",
+    ["rev-parse", "--abbrev-ref", "@{u}"],
+    { cwd: ctx.cwd },
+  );
+  const [pushResult, commits] = await Promise.all([
+    pi.exec(
       "git",
       upstreamResult.code === 0
         ? ["push"]
         : ["push", "--set-upstream", "origin", "HEAD"],
       { cwd: ctx.cwd },
-    );
+    ),
+    readNewCommits(pi, ctx, previousHead),
+  ]);
 
-    const pushed = pushResult.code === 0;
-    await echoNewCommits(
-      pi,
-      ctx,
-      previousHead,
-      pushed ? "Committed & pushed" : "Committed, push failed",
-    );
-    if (!pushed) {
-      ctx.ui.notify(pushResult.stderr.trim() || "Push failed", "error");
-    }
-  } catch (error) {
-    ctx.ui.notify(
-      error instanceof Error ? error.message : "Quick commit failed",
-      "error",
-    );
-  } finally {
-    clearProgress(ctx);
+  const pushed = pushResult.code === 0;
+  echoNewCommits(
+    pi,
+    ctx,
+    commits,
+    pushed ? "Committed & pushed" : "Committed, push failed",
+  );
+  if (!pushed) {
+    ctx.ui.notify(pushResult.stderr.trim() || "Push failed", "error");
   }
 }
 
 async function commitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
-  if (!ctx.isIdle()) {
-    ctx.ui.notify("Agent is busy; wait before committing", "warning");
-    return;
-  }
+  const previousHead = await readHead(pi, ctx);
+  const commitResult = await pi.exec("omp", ["commit", "--push"], {
+    cwd: ctx.cwd,
+  });
 
-  try {
-    await showProgress(ctx, PROGRESS_TEXT);
-    const previousHead = await readHead(pi, ctx);
+  const commits = await readNewCommits(pi, ctx, previousHead);
+  const headMoved = echoNewCommits(
+    pi,
+    ctx,
+    commits,
+    "Committed & pushed",
+  );
 
-    const commitResult = await pi.exec("omp", ["commit", "--push"], {
-      cwd: ctx.cwd,
-    });
+  const failureMessage =
+    commitResult.stderr.trim() ||
+    commitResult.stdout.trim() ||
+    "Commit failed";
 
-    const headMoved = await echoNewCommits(
-      pi,
-      ctx,
-      previousHead,
-      "Committed & pushed",
-    );
-
-    const failureMessage =
-      commitResult.stderr.trim() ||
-      commitResult.stdout.trim() ||
-      "Commit failed";
-
-    if (commitResult.killed) {
-      ctx.ui.notify("Commit cancelled", "warning");
-    } else if (commitResult.code !== 0) {
-      ctx.ui.notify(failureMessage, headMoved ? "warning" : "error");
-    } else if (!headMoved) {
-      ctx.ui.notify("No new commit created", "warning");
-    }
-  } catch (error) {
-    ctx.ui.notify(
-      error instanceof Error ? error.message : "Commit failed",
-      "error",
-    );
-  } finally {
-    clearProgress(ctx);
+  if (commitResult.killed) {
+    ctx.ui.notify("Commit cancelled", "warning");
+  } else if (commitResult.code !== 0) {
+    ctx.ui.notify(failureMessage, headMoved ? "warning" : "error");
+  } else if (!headMoved) {
+    ctx.ui.notify("No new commit created", "warning");
   }
 }
 
 export default function (pi: ExtensionAPI) {
+  const commitHandler = (ctx: ExtensionContext) =>
+    runCommitOperation(ctx, PROGRESS_TEXT, "Commit failed", () =>
+      commitAndPush(pi, ctx),
+    );
+  const quickCommitHandler = (ctx: ExtensionContext) =>
+    runCommitOperation(ctx, QUICK_PROGRESS_TEXT, "Quick commit failed", () =>
+      quickCommitAndPush(pi, ctx),
+    );
+
   pi.registerCommand("commit", {
     description: "Commit all changes and push",
-    handler: (_args, ctx) => commitAndPush(pi, ctx),
+    handler: (_args, ctx) => commitHandler(ctx),
   });
 
   pi.registerCommand("quick-commit", {
     description: "Commit & push with a message summarized from agent context",
-    handler: (_args, ctx) => quickCommitAndPush(pi, ctx),
+    handler: (_args, ctx) => quickCommitHandler(ctx),
   });
 
   pi.registerShortcut("alt+c", {
     description: "Commit & push",
-    handler: (ctx) => commitAndPush(pi, ctx),
+    handler: commitHandler,
   });
 
   pi.registerShortcut("alt+q", {
     description: "Quick commit & push from agent context",
-    handler: (ctx) => quickCommitAndPush(pi, ctx),
+    handler: quickCommitHandler,
   });
 }

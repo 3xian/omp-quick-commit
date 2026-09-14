@@ -47,11 +47,11 @@ In the TUI, a spinner row above the editor reports progress with the same shimme
 
 No diff pipeline and no changelog updates: the message comes from what the agent just did.
 
-1. Stages everything (`git add -A`) and stops with a notification when nothing is staged.
-2. Reads the last 12 messages of the current branch (user requests + agent replies, plus the paths the agent edited) and asks the commit role (`@commit`, falling back to `@smol` then the session model) for one conventional-commit message. The description follows the conversation's language; the type prefix stays English.
-3. Runs `git commit -m <message>`, then `git push`, falling back to `git push --set-upstream origin HEAD` when the branch has no upstream.
+1. Checks `git status --porcelain` and stops before the model call when the tree is clean.
+2. Stages everything while the commit role summarizes a bounded recent context in parallel. The role resolves as `@commit`, falling back to `@smol` then the session model; the description follows the conversation's language and the type prefix stays English.
+3. Verifies that staging produced a diff, snapshots `HEAD`, commits, then resolves the current upstream before reading the new commit log while pushing. A branch without an upstream uses `git push --set-upstream origin HEAD`.
 
-It does nothing (with a notification) when the agent is busy, when the session has no agent context yet (use `/commit`), or when the working tree is already clean.
+It does nothing (with a notification) when the agent is busy, another commit is already running, the session has no agent context yet (use `/commit`), or the working tree is already clean.
 
 Both Alt shortcuts require the terminal to report Alt as Meta. On macOS that means enabling "Use Option as Meta key" in Terminal.app (or `Esc+` in iTerm2), otherwise Option+Q types `œ` and the shortcut never fires.
 
