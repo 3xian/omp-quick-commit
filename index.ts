@@ -6,6 +6,7 @@ import { Loader, type LoaderMessageColorFn } from "@oh-my-pi/pi-tui";
 const PROGRESS_KEY = "omp-quick-commit";
 const PROGRESS_TEXT = "Committing & pushing...";
 const QUICK_PROGRESS_TEXT = "Summarizing context & committing...";
+const PUSH_PROGRESS_TEXT = "Pushing...";
 
 /** Most recent session entries scanned for the quick-commit summary. */
 const CONTEXT_ENTRIES = 12;
@@ -421,6 +422,8 @@ async function quickCommitAndPush(pi: ExtensionAPI, ctx: ExtensionContext) {
     ctx.ui.notify(failure, "error");
     return;
   }
+
+  showProgress(ctx, PUSH_PROGRESS_TEXT);
 
   // A fresh branch needs an explicit origin upstream.
   const upstreamResult = await pi.exec(
